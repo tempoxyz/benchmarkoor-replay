@@ -105,7 +105,8 @@ async fn main() -> Result<()> {
                 schelk::run(&cli.schelk_bin, ["recover"])?;
             }
             if args.drop_caches {
-                schelk::drop_caches()?;
+                let report = schelk::drop_caches()?;
+                println!("drop_caches=succeeded path={}", report.path);
             }
         }
         Command::Schelk(SchelkCommand::FullRecover(args)) => {

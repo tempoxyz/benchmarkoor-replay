@@ -1,7 +1,8 @@
 use std::{
     fs,
     path::Path,
-    time::{SystemTime, UNIX_EPOCH},
+    process::Command,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result};
@@ -11,14 +12,80 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::{
-    cli::{Cli, ReplayArgs, ReplayMode, RunArgs, RunManyArgs},
+    cli::{Cli, ReplayArgs, ReplayMode, RunArgs, RunManyArgs, RunManyMode},
     index::{FixtureIndex, StepFile, TestEntry, TestQuery},
-    jsonrpc::{parse_request_line, validate_engine_response, JsonRpcResponse},
+    jsonrpc::{parse_request_line, request_metrics, validate_engine_response, JsonRpcResponse},
     schelk,
     suite::Suite,
 };
 
 const DRY_RUN_PRINT_LIMIT: usize = 50;
+
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+pub struct ReplayStats {
+    pub request_count: u64,
+    pub payload_count: u64,
+    pub gas_used: u64,
+}
+
+impl ReplayStats {
+    fn add(&mut self, other: ReplayStats) {
+        self.request_count += other.request_count;
+        self.payload_count += other.payload_count;
+        self.gas_used += other.gas_used;
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct RunManyResult {
+    kind: &'static str,
+    suite: String,
+    test: String,
+    repetition: usize,
+    mode: RunManyMode,
+    started_at: String,
+    schelk_recovered: bool,
+    cache_drop: schelk::DropCachesReport,
+    node_restart: NodeRestartReport,
+    #[serde(rename = "setup_elapsed")]
+    setup_elapsed_secs: Option<f64>,
+    #[serde(rename = "testing_elapsed")]
+    testing_elapsed_secs: Option<f64>,
+    #[serde(rename = "total_elapsed")]
+    total_elapsed_secs: f64,
+    setup_request_count: u64,
+    setup_payload_count: u64,
+    setup_gas_used: u64,
+    testing_request_count: u64,
+    testing_payload_count: u64,
+    testing_gas_used: u64,
+    request_count: u64,
+    payload_count: u64,
+    gas_used: u64,
+    #[serde(rename = "gas_per_sec")]
+    testing_gas_per_sec: Option<f64>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct NodeRestartReport {
+    requested: bool,
+    command: Option<String>,
+    succeeded: bool,
+    elapsed_secs: Option<f64>,
+    error: Option<String>,
+}
+
+impl NodeRestartReport {
+    fn not_requested() -> Self {
+        Self {
+            requested: false,
+            command: None,
+            succeeded: false,
+            elapsed_secs: None,
+            error: None,
+        }
+    }
+}
 
 pub async fn replay_files(cli: &Cli, args: ReplayArgs) -> Result<()> {
     let mut client = EngineClient::new(&cli.engine_url, cli.jwt_secret.as_deref(), args.dry_run)?;
@@ -41,28 +108,281 @@ pub async fn run_one(cli: &Cli, _suite: &Suite, index: &FixtureIndex, args: RunA
 
 pub async fn run_many(
     cli: &Cli,
-    _suite: &Suite,
+    suite: &Suite,
     index: &FixtureIndex,
     args: RunManyArgs,
 ) -> Result<()> {
     if args.limit == 0 {
         anyhow::bail!("--limit must be greater than zero");
     }
+    if args.repetitions == 0 {
+        anyhow::bail!("--repetitions must be greater than zero");
+    }
+    if args.restart_node_command.is_some() && args.mode != RunManyMode::SetupThenTesting {
+        anyhow::bail!("--restart-node-command requires --mode setup-then-testing");
+    }
     let query = TestQuery::from(args.query.clone());
     let matches = index.search(&query)?;
     if matches.is_empty() {
         anyhow::bail!("no tests matched query");
     }
-    let mut client = EngineClient::new(&cli.engine_url, cli.jwt_secret.as_deref(), args.dry_run)?;
-    for (idx, test) in matches.into_iter().take(args.limit).enumerate() {
-        if idx > 0 && !args.no_schelk {
-            schelk::recover(&cli.schelk_bin, args.drop_caches)?;
+
+    let tests = matches.into_iter().take(args.limit).collect::<Vec<_>>();
+    let mut run_index = 0usize;
+    for test in tests {
+        for repetition in 1..=args.repetitions {
+            let result = if args.mode == RunManyMode::SetupThenTesting {
+                run_setup_then_testing(cli, suite, test, repetition, &args).await
+            } else {
+                run_simple_many(cli, suite, index, test, repetition, &args, run_index > 0).await
+            }
+            .with_context(|| format!("running {} repetition {}", test.name, repetition))?;
+            emit_run_many_result(&result, args.json)?;
+            run_index += 1;
         }
-        replay_test(index, test, args.mode, &mut client)
-            .await
-            .with_context(|| format!("running {}", test.name))?;
     }
     Ok(())
+}
+
+async fn run_simple_many(
+    cli: &Cli,
+    suite: &Suite,
+    index: &FixtureIndex,
+    test: &TestEntry,
+    repetition: usize,
+    args: &RunManyArgs,
+    recover_before: bool,
+) -> Result<RunManyResult> {
+    let started_at = chrono::Utc::now().to_rfc3339();
+    let total_start = Instant::now();
+    let mut cache_drop = schelk::DropCachesReport::not_requested();
+    let mut schelk_recovered = false;
+
+    if recover_before && !args.no_schelk {
+        schelk::run(&cli.schelk_bin, ["recover"])?;
+        schelk_recovered = true;
+        if args.drop_caches {
+            cache_drop = schelk::drop_caches()?;
+        }
+    }
+
+    let mode = args
+        .mode
+        .as_replay_mode()
+        .ok_or_else(|| anyhow::anyhow!("setup-then-testing requires measured orchestration"))?;
+    let mut client = run_many_client(cli, args)?;
+    let (stats, elapsed) = timed_replay_test(index, test, mode, &mut client).await?;
+    let (setup_stats, testing_stats, testing_elapsed_secs) = match mode {
+        ReplayMode::Setup => (stats, ReplayStats::default(), None),
+        ReplayMode::Testing => (ReplayStats::default(), stats, Some(seconds(elapsed))),
+        _ => (ReplayStats::default(), ReplayStats::default(), None),
+    };
+
+    Ok(build_run_many_result(
+        suite,
+        test,
+        repetition,
+        args.mode,
+        started_at,
+        schelk_recovered,
+        cache_drop,
+        NodeRestartReport::not_requested(),
+        None,
+        testing_elapsed_secs,
+        total_start.elapsed(),
+        setup_stats,
+        testing_stats,
+        stats,
+    ))
+}
+
+async fn run_setup_then_testing(
+    cli: &Cli,
+    suite: &Suite,
+    test: &TestEntry,
+    repetition: usize,
+    args: &RunManyArgs,
+) -> Result<RunManyResult> {
+    let started_at = chrono::Utc::now().to_rfc3339();
+    let total_start = Instant::now();
+    let mut schelk_recovered = false;
+
+    if !args.no_schelk {
+        schelk::run(&cli.schelk_bin, ["recover"])?;
+        schelk_recovered = true;
+    }
+
+    let mut setup_client = run_many_client(cli, args)?;
+    let (setup_stats, setup_elapsed) =
+        timed_replay_optional_step(&mut setup_client, &test.setup).await?;
+    drop(setup_client);
+
+    let node_restart = restart_node(args.restart_node_command.as_deref())?;
+    let cache_drop = if args.drop_caches {
+        schelk::drop_caches()?
+    } else {
+        schelk::DropCachesReport::not_requested()
+    };
+
+    let mut testing_client = run_many_client(cli, args)?;
+    let (testing_stats, testing_elapsed) =
+        timed_replay_optional_step(&mut testing_client, &test.testing).await?;
+    let mut total_stats = setup_stats;
+    total_stats.add(testing_stats);
+
+    Ok(build_run_many_result(
+        suite,
+        test,
+        repetition,
+        args.mode,
+        started_at,
+        schelk_recovered,
+        cache_drop,
+        node_restart,
+        Some(seconds(setup_elapsed)),
+        Some(seconds(testing_elapsed)),
+        total_start.elapsed(),
+        setup_stats,
+        testing_stats,
+        total_stats,
+    ))
+}
+
+fn build_run_many_result(
+    suite: &Suite,
+    test: &TestEntry,
+    repetition: usize,
+    mode: RunManyMode,
+    started_at: String,
+    schelk_recovered: bool,
+    cache_drop: schelk::DropCachesReport,
+    node_restart: NodeRestartReport,
+    setup_elapsed_secs: Option<f64>,
+    testing_elapsed_secs: Option<f64>,
+    total_elapsed: Duration,
+    setup_stats: ReplayStats,
+    testing_stats: ReplayStats,
+    total_stats: ReplayStats,
+) -> RunManyResult {
+    RunManyResult {
+        kind: "run_many_result",
+        suite: suite.id.clone(),
+        test: test.name.clone(),
+        repetition,
+        mode,
+        started_at,
+        schelk_recovered,
+        cache_drop,
+        node_restart,
+        setup_elapsed_secs,
+        testing_elapsed_secs,
+        total_elapsed_secs: seconds(total_elapsed),
+        setup_request_count: setup_stats.request_count,
+        setup_payload_count: setup_stats.payload_count,
+        setup_gas_used: setup_stats.gas_used,
+        testing_request_count: testing_stats.request_count,
+        testing_payload_count: testing_stats.payload_count,
+        testing_gas_used: testing_stats.gas_used,
+        request_count: total_stats.request_count,
+        payload_count: total_stats.payload_count,
+        gas_used: total_stats.gas_used,
+        testing_gas_per_sec: testing_elapsed_secs.and_then(|elapsed| {
+            (elapsed > 0.0 && testing_stats.gas_used > 0)
+                .then(|| testing_stats.gas_used as f64 / elapsed)
+        }),
+    }
+}
+
+async fn timed_replay_test(
+    index: &FixtureIndex,
+    test: &TestEntry,
+    mode: ReplayMode,
+    client: &mut EngineClient,
+) -> Result<(ReplayStats, Duration)> {
+    let start = Instant::now();
+    let stats = replay_test_stats(index, test, mode, client).await?;
+    Ok((stats, start.elapsed()))
+}
+
+async fn timed_replay_optional_step(
+    client: &mut EngineClient,
+    step: &Option<StepFile>,
+) -> Result<(ReplayStats, Duration)> {
+    let start = Instant::now();
+    let stats = replay_optional_step(client, step).await?;
+    Ok((stats, start.elapsed()))
+}
+
+fn restart_node(command: Option<&str>) -> Result<NodeRestartReport> {
+    let Some(command) = command else {
+        return Ok(NodeRestartReport::not_requested());
+    };
+
+    let start = Instant::now();
+    let output = Command::new("sh")
+        .arg("-c")
+        .arg(command)
+        .output()
+        .with_context(|| format!("running restart node command: {command}"))?;
+    let elapsed_secs = Some(seconds(start.elapsed()));
+    if output.status.success() {
+        return Ok(NodeRestartReport {
+            requested: true,
+            command: Some(command.to_string()),
+            succeeded: true,
+            elapsed_secs,
+            error: None,
+        });
+    }
+
+    let mut text = String::from_utf8_lossy(&output.stdout).to_string();
+    text.push_str(&String::from_utf8_lossy(&output.stderr));
+    let error = format!("command exited with {}: {}", output.status, text.trim());
+    Err(anyhow::anyhow!(error)).with_context(|| format!("restart node command failed: {command}"))
+}
+
+fn emit_run_many_result(result: &RunManyResult, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string(result)?);
+        return Ok(());
+    }
+
+    if result.mode == RunManyMode::SetupThenTesting {
+        println!(
+            "test={} repetition={} testing_elapsed_secs={:.6} testing_requests={} testing_payloads={} testing_gas={} testing_gas_per_sec={:.3} drop_caches={} node_restart={}",
+            result.test,
+            result.repetition,
+            result.testing_elapsed_secs.unwrap_or_default(),
+            result.testing_request_count,
+            result.testing_payload_count,
+            result.testing_gas_used,
+            result.testing_gas_per_sec.unwrap_or_default(),
+            report_state(result.cache_drop.requested, result.cache_drop.succeeded),
+            report_state(result.node_restart.requested, result.node_restart.succeeded),
+        );
+    }
+    Ok(())
+}
+
+fn report_state(requested: bool, succeeded: bool) -> &'static str {
+    match (requested, succeeded) {
+        (false, _) => "not-requested",
+        (true, true) => "succeeded",
+        (true, false) => "failed",
+    }
+}
+
+fn seconds(duration: Duration) -> f64 {
+    duration.as_secs_f64()
+}
+
+fn run_many_client(cli: &Cli, args: &RunManyArgs) -> Result<EngineClient> {
+    EngineClient::new_with_dry_run_print(
+        &cli.engine_url,
+        cli.jwt_secret.as_deref(),
+        args.dry_run,
+        !args.json,
+    )
 }
 
 pub fn run_command(
@@ -113,10 +433,21 @@ pub async fn replay_test(
     mode: ReplayMode,
     client: &mut EngineClient,
 ) -> Result<()> {
+    replay_test_stats(index, test, mode, client).await?;
+    Ok(())
+}
+
+async fn replay_test_stats(
+    index: &FixtureIndex,
+    test: &TestEntry,
+    mode: ReplayMode,
+    client: &mut EngineClient,
+) -> Result<ReplayStats> {
+    let mut stats = ReplayStats::default();
     match mode {
         ReplayMode::Prerun => {
             for step in &index.pre_run {
-                client.replay_file(&step.abs_path).await?;
+                stats.add(client.replay_file(&step.abs_path).await?);
             }
         }
         ReplayMode::Funding => {
@@ -125,20 +456,23 @@ pub async fn replay_test(
                 .iter()
                 .filter(|step| step.name == "funding.txt")
             {
-                client.replay_file(&step.abs_path).await?;
+                stats.add(client.replay_file(&step.abs_path).await?);
             }
         }
-        ReplayMode::Setup => replay_optional_step(client, &test.setup).await?,
-        ReplayMode::Testing => replay_optional_step(client, &test.testing).await?,
+        ReplayMode::Setup => stats.add(replay_optional_step(client, &test.setup).await?),
+        ReplayMode::Testing => stats.add(replay_optional_step(client, &test.testing).await?),
         ReplayMode::Full => {
-            replay_optional_step(client, &test.setup).await?;
-            replay_optional_step(client, &test.testing).await?;
+            stats.add(replay_optional_step(client, &test.setup).await?);
+            stats.add(replay_optional_step(client, &test.testing).await?);
         }
     }
-    Ok(())
+    Ok(stats)
 }
 
-async fn replay_optional_step(client: &mut EngineClient, step: &Option<StepFile>) -> Result<()> {
+async fn replay_optional_step(
+    client: &mut EngineClient,
+    step: &Option<StepFile>,
+) -> Result<ReplayStats> {
     let step = step
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("selected test does not have this step"))?;
@@ -150,22 +484,34 @@ pub struct EngineClient {
     http: reqwest::Client,
     jwt_secret: Option<Vec<u8>>,
     dry_run: bool,
+    dry_run_print: bool,
 }
 
 impl EngineClient {
     pub fn new(endpoint: &str, jwt_secret: Option<&Path>, dry_run: bool) -> Result<Self> {
+        Self::new_with_dry_run_print(endpoint, jwt_secret, dry_run, true)
+    }
+
+    fn new_with_dry_run_print(
+        endpoint: &str,
+        jwt_secret: Option<&Path>,
+        dry_run: bool,
+        dry_run_print: bool,
+    ) -> Result<Self> {
         let jwt_secret = jwt_secret.map(read_jwt_secret).transpose()?;
         Ok(Self {
             endpoint: endpoint.to_string(),
             http: reqwest::Client::new(),
             jwt_secret,
             dry_run,
+            dry_run_print,
         })
     }
 
-    pub async fn replay_file(&mut self, path: &Path) -> Result<()> {
+    pub async fn replay_file(&mut self, path: &Path) -> Result<ReplayStats> {
         let data =
             fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        let mut stats = ReplayStats::default();
         let mut dry_run_printed = 0usize;
         let mut dry_run_omitted = 0usize;
         for (line_no, line) in data.lines().enumerate() {
@@ -175,8 +521,14 @@ impl EngineClient {
             }
             let request = parse_request_line(line)
                 .with_context(|| format!("{}:{}", path.display(), line_no + 1))?;
+            stats.request_count += 1;
+            let metrics = request_metrics(&request).with_context(|| {
+                format!("extracting metrics at {}:{}", path.display(), line_no + 1)
+            })?;
+            stats.payload_count += metrics.payload_count;
+            stats.gas_used += metrics.gas_used;
             if self.dry_run {
-                if dry_run_printed < DRY_RUN_PRINT_LIMIT {
+                if self.dry_run_print && dry_run_printed < DRY_RUN_PRINT_LIMIT {
                     println!(
                         "dry-run {}:{} {}",
                         path.display(),
@@ -184,7 +536,7 @@ impl EngineClient {
                         request.method
                     );
                     dry_run_printed += 1;
-                } else {
+                } else if self.dry_run_print {
                     dry_run_omitted += 1;
                 }
                 continue;
@@ -214,7 +566,7 @@ impl EngineClient {
                 )
             })?;
         }
-        if self.dry_run && dry_run_omitted > 0 {
+        if self.dry_run && self.dry_run_print && dry_run_omitted > 0 {
             println!(
                 "dry-run {}: omitted {} additional requests after first {}",
                 path.display(),
@@ -222,7 +574,7 @@ impl EngineClient {
                 DRY_RUN_PRINT_LIMIT
             );
         }
-        Ok(())
+        Ok(stats)
     }
 
     async fn send(&self, request: Value) -> Result<JsonRpcResponse> {
@@ -311,5 +663,71 @@ mod tests {
         assert!(cmd.contains("--jwt-secret '/tmp/jwt hex'"));
         assert!(cmd.contains("--test 'test file.txt'"));
         assert!(cmd.contains("--mode full"));
+    }
+
+    #[tokio::test]
+    async fn replay_file_collects_dry_run_stats() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        fs::write(
+            tmp.path(),
+            concat!(
+                r#"{"jsonrpc":"2.0","id":1,"method":"engine_newPayloadV3","params":[{"gasUsed":"0x64"}]}"#,
+                "\n",
+                r#"{"jsonrpc":"2.0","id":2,"method":"engine_forkchoiceUpdatedV3","params":[]}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+
+        let mut client = EngineClient::new("http://127.0.0.1:8551", None, true).unwrap();
+        let stats = client.replay_file(tmp.path()).await.unwrap();
+        assert_eq!(stats.request_count, 2);
+        assert_eq!(stats.payload_count, 1);
+        assert_eq!(stats.gas_used, 100);
+    }
+
+    #[test]
+    fn run_many_result_json_uses_measured_field_names() {
+        let suite = Suite::resolve(
+            "perf-devnet-3/24358000",
+            "repricing",
+            "amsterdam",
+            "stateful",
+            Path::new("/tmp/metadata"),
+        )
+        .unwrap();
+        let test = TestEntry {
+            name: "example.txt".to_string(),
+            ..Default::default()
+        };
+        let result = build_run_many_result(
+            &suite,
+            &test,
+            1,
+            RunManyMode::SetupThenTesting,
+            "2026-05-12T00:00:00Z".to_string(),
+            true,
+            schelk::DropCachesReport::not_requested(),
+            NodeRestartReport::not_requested(),
+            Some(1.0),
+            Some(2.0),
+            Duration::from_secs(3),
+            ReplayStats::default(),
+            ReplayStats {
+                request_count: 2,
+                payload_count: 1,
+                gas_used: 100,
+            },
+            ReplayStats {
+                request_count: 2,
+                payload_count: 1,
+                gas_used: 100,
+            },
+        );
+        let json = serde_json::to_value(result).unwrap();
+        assert_eq!(json["testing_elapsed"], 2.0);
+        assert_eq!(json["gas_per_sec"], 50.0);
+        assert!(json.get("testing_elapsed_secs").is_none());
+        assert!(json.get("testing_gas_per_sec").is_none());
     }
 }
