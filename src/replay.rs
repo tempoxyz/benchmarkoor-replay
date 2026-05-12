@@ -178,22 +178,22 @@ async fn run_simple_many(
         _ => (ReplayStats::default(), ReplayStats::default(), None),
     };
 
-    Ok(build_run_many_result(
+    Ok(build_run_many_result(RunManyResultParts {
         suite,
         test,
         repetition,
-        args.mode,
+        mode: args.mode,
         started_at,
         schelk_recovered,
         cache_drop,
-        NodeRestartReport::not_requested(),
-        None,
+        node_restart: NodeRestartReport::not_requested(),
+        setup_elapsed_secs: None,
         testing_elapsed_secs,
-        total_start.elapsed(),
+        total_elapsed: total_start.elapsed(),
         setup_stats,
         testing_stats,
-        stats,
-    ))
+        total_stats: stats,
+    }))
 }
 
 async fn run_setup_then_testing(
@@ -230,27 +230,27 @@ async fn run_setup_then_testing(
     let mut total_stats = setup_stats;
     total_stats.add(testing_stats);
 
-    Ok(build_run_many_result(
+    Ok(build_run_many_result(RunManyResultParts {
         suite,
         test,
         repetition,
-        args.mode,
+        mode: args.mode,
         started_at,
         schelk_recovered,
         cache_drop,
         node_restart,
-        Some(seconds(setup_elapsed)),
-        Some(seconds(testing_elapsed)),
-        total_start.elapsed(),
+        setup_elapsed_secs: Some(seconds(setup_elapsed)),
+        testing_elapsed_secs: Some(seconds(testing_elapsed)),
+        total_elapsed: total_start.elapsed(),
         setup_stats,
         testing_stats,
         total_stats,
-    ))
+    }))
 }
 
-fn build_run_many_result(
-    suite: &Suite,
-    test: &TestEntry,
+struct RunManyResultParts<'a> {
+    suite: &'a Suite,
+    test: &'a TestEntry,
     repetition: usize,
     mode: RunManyMode,
     started_at: String,
@@ -263,32 +263,34 @@ fn build_run_many_result(
     setup_stats: ReplayStats,
     testing_stats: ReplayStats,
     total_stats: ReplayStats,
-) -> RunManyResult {
+}
+
+fn build_run_many_result(parts: RunManyResultParts<'_>) -> RunManyResult {
     RunManyResult {
         kind: "run_many_result",
-        suite: suite.id.clone(),
-        test: test.name.clone(),
-        repetition,
-        mode,
-        started_at,
-        schelk_recovered,
-        cache_drop,
-        node_restart,
-        setup_elapsed_secs,
-        testing_elapsed_secs,
-        total_elapsed_secs: seconds(total_elapsed),
-        setup_request_count: setup_stats.request_count,
-        setup_payload_count: setup_stats.payload_count,
-        setup_gas_used: setup_stats.gas_used,
-        testing_request_count: testing_stats.request_count,
-        testing_payload_count: testing_stats.payload_count,
-        testing_gas_used: testing_stats.gas_used,
-        request_count: total_stats.request_count,
-        payload_count: total_stats.payload_count,
-        gas_used: total_stats.gas_used,
-        testing_gas_per_sec: testing_elapsed_secs.and_then(|elapsed| {
-            (elapsed > 0.0 && testing_stats.gas_used > 0)
-                .then(|| testing_stats.gas_used as f64 / elapsed)
+        suite: parts.suite.id.clone(),
+        test: parts.test.name.clone(),
+        repetition: parts.repetition,
+        mode: parts.mode,
+        started_at: parts.started_at,
+        schelk_recovered: parts.schelk_recovered,
+        cache_drop: parts.cache_drop,
+        node_restart: parts.node_restart,
+        setup_elapsed_secs: parts.setup_elapsed_secs,
+        testing_elapsed_secs: parts.testing_elapsed_secs,
+        total_elapsed_secs: seconds(parts.total_elapsed),
+        setup_request_count: parts.setup_stats.request_count,
+        setup_payload_count: parts.setup_stats.payload_count,
+        setup_gas_used: parts.setup_stats.gas_used,
+        testing_request_count: parts.testing_stats.request_count,
+        testing_payload_count: parts.testing_stats.payload_count,
+        testing_gas_used: parts.testing_stats.gas_used,
+        request_count: parts.total_stats.request_count,
+        payload_count: parts.total_stats.payload_count,
+        gas_used: parts.total_stats.gas_used,
+        testing_gas_per_sec: parts.testing_elapsed_secs.and_then(|elapsed| {
+            (elapsed > 0.0 && parts.testing_stats.gas_used > 0)
+                .then(|| parts.testing_stats.gas_used as f64 / elapsed)
         }),
     }
 }
@@ -700,30 +702,30 @@ mod tests {
             name: "example.txt".to_string(),
             ..Default::default()
         };
-        let result = build_run_many_result(
-            &suite,
-            &test,
-            1,
-            RunManyMode::SetupThenTesting,
-            "2026-05-12T00:00:00Z".to_string(),
-            true,
-            schelk::DropCachesReport::not_requested(),
-            NodeRestartReport::not_requested(),
-            Some(1.0),
-            Some(2.0),
-            Duration::from_secs(3),
-            ReplayStats::default(),
-            ReplayStats {
+        let result = build_run_many_result(RunManyResultParts {
+            suite: &suite,
+            test: &test,
+            repetition: 1,
+            mode: RunManyMode::SetupThenTesting,
+            started_at: "2026-05-12T00:00:00Z".to_string(),
+            schelk_recovered: true,
+            cache_drop: schelk::DropCachesReport::not_requested(),
+            node_restart: NodeRestartReport::not_requested(),
+            setup_elapsed_secs: Some(1.0),
+            testing_elapsed_secs: Some(2.0),
+            total_elapsed: Duration::from_secs(3),
+            setup_stats: ReplayStats::default(),
+            testing_stats: ReplayStats {
                 request_count: 2,
                 payload_count: 1,
                 gas_used: 100,
             },
-            ReplayStats {
+            total_stats: ReplayStats {
                 request_count: 2,
                 payload_count: 1,
                 gas_used: 100,
             },
-        );
+        });
         let json = serde_json::to_value(result).unwrap();
         assert_eq!(json["testing_elapsed"], 2.0);
         assert_eq!(json["gas_per_sec"], 50.0);
