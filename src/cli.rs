@@ -295,24 +295,36 @@ pub struct RunManyArgs {
     pub query: QueryArgs,
 
     /// Which files to replay for each test.
-    #[arg(long, value_enum, default_value_t = ReplayMode::Full)]
-    pub mode: ReplayMode,
+    #[arg(long, value_enum, default_value_t = RunManyMode::Full)]
+    pub mode: RunManyMode,
 
     /// Maximum tests to run.
     #[arg(long, default_value_t = 10, value_parser = parse_nonzero_limit)]
     pub limit: usize,
 
+    /// Number of repetitions to run for each selected test.
+    #[arg(long, default_value_t = 1, value_parser = parse_nonzero_limit)]
+    pub repetitions: usize,
+
     /// Replay without sending requests.
     #[arg(long)]
     pub dry_run: bool,
 
-    /// Do not call schelk recover between tests.
+    /// Do not call schelk recover between tests, or before each measured repetition.
     #[arg(long)]
     pub no_schelk: bool,
 
-    /// Drop Linux page cache after each schelk recover.
+    /// Drop Linux page cache after each schelk recover, or after setup in measured mode.
     #[arg(long)]
     pub drop_caches: bool,
+
+    /// Print one structured JSON result per test repetition.
+    #[arg(long)]
+    pub json: bool,
+
+    /// Shell command that restarts the node after setup and before measured testing.
+    #[arg(long, env = "BENCHMARKOOR_REPLAY_RESTART_NODE_COMMAND")]
+    pub restart_node_command: Option<String>,
 }
 
 #[derive(Debug, Args, Clone)]
@@ -354,6 +366,36 @@ pub enum ReplayMode {
     Testing,
     /// Setup then testing, without recovery between them.
     Full,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RunManyMode {
+    /// Gas bump plus funding pre-run files.
+    Prerun,
+    /// Funding pre-run files only.
+    Funding,
+    /// Setup file only.
+    Setup,
+    /// Testing file only.
+    Testing,
+    /// Setup then testing, without recovery between them.
+    Full,
+    /// Recover, run setup unmeasured, optionally restart/drop caches, then measure testing.
+    SetupThenTesting,
+}
+
+impl RunManyMode {
+    pub fn as_replay_mode(self) -> Option<ReplayMode> {
+        match self {
+            Self::Prerun => Some(ReplayMode::Prerun),
+            Self::Funding => Some(ReplayMode::Funding),
+            Self::Setup => Some(ReplayMode::Setup),
+            Self::Testing => Some(ReplayMode::Testing),
+            Self::Full => Some(ReplayMode::Full),
+            Self::SetupThenTesting => None,
+        }
+    }
 }
 
 #[derive(Debug, Subcommand, Clone)]

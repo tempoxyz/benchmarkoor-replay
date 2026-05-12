@@ -1,6 +1,28 @@
 use std::{ffi::OsStr, fs, process::Command};
 
 use anyhow::{Context, Result};
+use serde::Serialize;
+
+const DROP_CACHES_PATH: &str = "/proc/sys/vm/drop_caches";
+
+#[derive(Clone, Debug, Serialize)]
+pub struct DropCachesReport {
+    pub requested: bool,
+    pub path: String,
+    pub succeeded: bool,
+    pub error: Option<String>,
+}
+
+impl DropCachesReport {
+    pub fn not_requested() -> Self {
+        Self {
+            requested: false,
+            path: DROP_CACHES_PATH.to_string(),
+            succeeded: false,
+            error: None,
+        }
+    }
+}
 
 pub fn run<I, S>(bin: &str, args: I) -> Result<()>
 where
@@ -49,6 +71,27 @@ pub fn recover(bin: &str, drop_caches_after: bool) -> Result<()> {
     Ok(())
 }
 
-pub fn drop_caches() -> Result<()> {
-    fs::write("/proc/sys/vm/drop_caches", b"3\n").context("dropping Linux page cache")
+pub fn drop_caches() -> Result<DropCachesReport> {
+    let report = try_drop_caches();
+    if let Some(error) = &report.error {
+        anyhow::bail!("dropping Linux page cache failed: {error}");
+    }
+    Ok(report)
+}
+
+pub fn try_drop_caches() -> DropCachesReport {
+    match fs::write(DROP_CACHES_PATH, b"3\n").context("dropping Linux page cache") {
+        Ok(()) => DropCachesReport {
+            requested: true,
+            path: DROP_CACHES_PATH.to_string(),
+            succeeded: true,
+            error: None,
+        },
+        Err(err) => DropCachesReport {
+            requested: true,
+            path: DROP_CACHES_PATH.to_string(),
+            succeeded: false,
+            error: Some(format!("{err:#}")),
+        },
+    }
 }

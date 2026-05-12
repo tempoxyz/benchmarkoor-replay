@@ -104,6 +104,23 @@ benchmarkoor-replay run-many --contains sload --limit 10 --mode full --drop-cach
 
 `run-many` recovers with schelk between tests. Use `--no-schelk` for dry fixture inspection.
 
+For setup-unmeasured, testing-measured runs, use the native measured mode:
+
+```sh
+benchmarkoor-replay run-many --contains sload --limit 10 --repetitions 3 \
+  --mode setup-then-testing \
+  --restart-node-command 'systemctl restart reth' \
+  --drop-caches \
+  --json
+```
+
+`setup-then-testing` recovers to the promoted post-prerun schelk baseline before every test
+repetition, replays setup without including it in the testing timer, optionally runs a node
+restart command, optionally drops Linux page cache, then measures only testing replay. The JSON
+output prints one object per test repetition with setup/testing elapsed seconds, request counts,
+newPayload counts, exact `gasUsed` summed from Engine API payloads, and testing gas/sec.
+`cache_drop` and `node_restart` fields report whether those controls were requested and succeeded.
+
 ## Snapshots
 
 Import the selected suite snapshot:
