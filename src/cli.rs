@@ -69,6 +69,9 @@ pub enum Command {
     /// Download, extract, normalize, and optionally migrate a Reth snapshot.
     #[command(subcommand)]
     Snapshot(SnapshotCommand),
+    /// Download the selected suite genesis file.
+    #[command(subcommand)]
+    Genesis(GenesisCommand),
     /// Prepare, promote, and verify schelk-backed baselines.
     #[command(subcommand)]
     Baseline(BaselineCommand),
@@ -179,6 +182,27 @@ pub struct ShowTestArgs {
 pub enum SnapshotCommand {
     /// Import the selected suite snapshot.
     Import(SnapshotImportArgs),
+}
+
+#[derive(Debug, Subcommand, Clone)]
+pub enum GenesisCommand {
+    /// Download the selected suite genesis file when missing.
+    Download(GenesisDownloadArgs),
+}
+
+#[derive(Debug, Args, Clone)]
+pub struct GenesisDownloadArgs {
+    /// Reth datadir used for the default genesis path.
+    #[arg(long)]
+    pub datadir: PathBuf,
+
+    /// Path to write/read the genesis file. Defaults to datadir/genesis.json.
+    #[arg(long)]
+    pub genesis: Option<PathBuf>,
+
+    /// Re-download even when the genesis file already exists.
+    #[arg(long)]
+    pub force: bool,
 }
 
 #[derive(Debug, Args, Clone)]
