@@ -4,7 +4,10 @@ use anyhow::{Context, Result};
 use futures_util::StreamExt;
 use tokio::io::AsyncWriteExt;
 
-use crate::{cli::SnapshotImportArgs, suite::Suite};
+use crate::{
+    cli::{GenesisDownloadArgs, SnapshotImportArgs},
+    suite::Suite,
+};
 
 pub async fn import_snapshot(
     suite: &Suite,
@@ -41,19 +44,8 @@ pub async fn import_snapshot(
     extract_snapshot(&archive, &args.datadir)?;
     normalize_datadir(&args.datadir)?;
 
-    let genesis_path = match args.genesis {
-        Some(path) => path,
-        None => args.datadir.join("genesis.json"),
-    };
-    if !genesis_path.exists() {
-        if suite.genesis_url.is_empty() {
-            anyhow::bail!(
-                "genesis file missing and suite has no genesis URL: {}",
-                genesis_path.display()
-            );
-        }
-        download_to_file(&suite.genesis_url, &genesis_path).await?;
-    }
+    let genesis_path = resolve_genesis_path(&args.datadir, args.genesis);
+    ensure_genesis(suite, &genesis_path, false).await?;
 
     if args.migrate_v2 {
         run_reth(
@@ -70,6 +62,46 @@ pub async fn import_snapshot(
     )?;
     println!("snapshot imported datadir={}", args.datadir.display());
     Ok(())
+}
+
+pub async fn download_genesis(suite: &Suite, args: GenesisDownloadArgs) -> Result<()> {
+    let genesis_path = resolve_genesis_path(&args.datadir, args.genesis);
+    match ensure_genesis(suite, &genesis_path, args.force).await? {
+        GenesisStatus::Existing => println!("genesis exists path={}", genesis_path.display()),
+        GenesisStatus::Downloaded => println!("genesis downloaded path={}", genesis_path.display()),
+    }
+    Ok(())
+}
+
+fn resolve_genesis_path(datadir: &Path, genesis: Option<std::path::PathBuf>) -> std::path::PathBuf {
+    genesis.unwrap_or_else(|| datadir.join("genesis.json"))
+}
+
+#[derive(Debug)]
+enum GenesisStatus {
+    Existing,
+    Downloaded,
+}
+
+async fn ensure_genesis(suite: &Suite, genesis_path: &Path, force: bool) -> Result<GenesisStatus> {
+    if genesis_path.exists() && !force {
+        return Ok(GenesisStatus::Existing);
+    }
+    if suite.genesis_url.is_empty() {
+        anyhow::bail!(
+            "genesis file missing and suite has no genesis URL: {}",
+            genesis_path.display()
+        );
+    }
+    if let Some(parent) = genesis_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("creating genesis directory {}", parent.display()))?;
+    }
+    download_to_file(&suite.genesis_url, genesis_path).await?;
+    Ok(GenesisStatus::Downloaded)
 }
 
 fn prepare_datadir(datadir: &Path, force: bool) -> Result<()> {
@@ -160,7 +192,7 @@ async fn download_to_file(url: &str, path: &Path) -> Result<()> {
     drop(file);
     tokio::fs::rename(&tmp, path).await.with_context(|| {
         format!(
-            "moving downloaded snapshot {} to {}",
+            "moving downloaded file {} to {}",
             tmp.display(),
             path.display()
         )
@@ -418,6 +450,73 @@ mod tests {
             path.file_name().and_then(|name| name.to_str()),
             Some("jochemnet-24402727-repricing-amsterdam-stateful-snapshot.tar.zst")
         );
+    }
+
+    #[test]
+    fn defaults_genesis_path_to_datadir() {
+        assert_eq!(
+            resolve_genesis_path(Path::new("/tmp/reth"), None),
+            Path::new("/tmp/reth/genesis.json")
+        );
+    }
+
+    #[test]
+    fn allows_explicit_genesis_path() {
+        assert_eq!(
+            resolve_genesis_path(
+                Path::new("/tmp/reth"),
+                Some(std::path::PathBuf::from("/tmp/custom-genesis.json")),
+            ),
+            Path::new("/tmp/custom-genesis.json")
+        );
+    }
+
+    #[tokio::test]
+    async fn existing_genesis_does_not_need_suite_url() {
+        let tmp = tempfile::tempdir().unwrap();
+        let genesis = tmp.path().join("genesis.json");
+        fs::write(&genesis, b"{}").unwrap();
+        let suite = Suite::resolve(
+            "custom/1",
+            "repricing",
+            "amsterdam",
+            "stateful",
+            Path::new("/missing"),
+        )
+        .unwrap();
+        ensure_genesis(&suite, &genesis, false).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn missing_genesis_requires_suite_url() {
+        let tmp = tempfile::tempdir().unwrap();
+        let genesis = tmp.path().join("genesis.json");
+        let suite = Suite::resolve(
+            "custom/1",
+            "repricing",
+            "amsterdam",
+            "stateful",
+            Path::new("/missing"),
+        )
+        .unwrap();
+        let err = ensure_genesis(&suite, &genesis, false).await.unwrap_err();
+        assert!(err.to_string().contains("suite has no genesis URL"));
+    }
+
+    #[tokio::test]
+    async fn relative_genesis_path_can_error_on_missing_url() {
+        let suite = Suite::resolve(
+            "custom/1",
+            "repricing",
+            "amsterdam",
+            "stateful",
+            Path::new("/missing"),
+        )
+        .unwrap();
+        let err = ensure_genesis(&suite, Path::new("genesis.json"), false)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("suite has no genesis URL"));
     }
 
     #[test]

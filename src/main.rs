@@ -60,6 +60,9 @@ async fn main() -> Result<()> {
         Command::Snapshot(SnapshotCommand::Import(args)) => {
             snapshot::import_snapshot(&suite, &cli.reth_bin, args).await?;
         }
+        Command::Genesis(GenesisCommand::Download(args)) => {
+            snapshot::download_genesis(&suite, args).await?;
+        }
         Command::Baseline(BaselineCommand::Prepare(args)) => {
             baseline::prepare(&cache_dir, &suite, &cli, args).await?;
         }

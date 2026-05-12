@@ -123,6 +123,17 @@ newPayload counts, exact `gasUsed` summed from Engine API payloads, and testing 
 
 ## Snapshots
 
+Download only the selected suite genesis:
+
+```sh
+benchmarkoor-replay genesis download --datadir /schelk/reth
+```
+
+This writes `/schelk/reth/genesis.json` from the selected suite metadata when it is missing.
+Use `--genesis /path/to/genesis.json` to write a different path, or `--force` to replace an
+existing file. For manifest-based bootstraps, run this after `reth download --manifest-path`
+because Reth downloads do not include the suite genesis.
+
 Import the selected suite snapshot:
 
 ```sh
