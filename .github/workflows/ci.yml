@@ -1,5 +1,7 @@
 name: CI
 
+permissions: {}
+
 on:
   pull_request:
   push:
@@ -14,6 +16,7 @@ jobs:
   rust:
     name: Rust
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
       contents: read
       id-token: write
@@ -27,17 +30,27 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install Rust components
-        run: rustup component add rustfmt clippy
+      - name: Install Rust toolchains
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup toolchain install nightly --profile minimal --component rustfmt --component clippy
+
+      - name: Install cargo-deny
+        uses: tempoxyz/gh-actions/vendor/taiki-e/install-action@55fe3b63d9612623cc51e6c62d9d62fbcb175fb0 # 2026-09-29T01-25-15Z-55fe3b63
+        with:
+          tool: cargo-deny@0.20.2
+
+      - name: Check dependency policy
+        run: cargo deny --locked check all
 
       - name: Check formatting
-        run: cargo fmt --all --check
+        run: cargo +nightly fmt --all --check
 
       - name: Check compilation
         run: cargo check --locked --all-targets
 
       - name: Lint
-        run: cargo clippy --locked --all-targets -- -D warnings
+        run: cargo +nightly clippy --locked --all-targets -- -D warnings
 
       - name: Test
         run: cargo test --locked
