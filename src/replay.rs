@@ -626,6 +626,8 @@ fn jwt(secret: &[u8]) -> Result<String> {
 mod tests {
     use super::*;
 
+    use jsonwebtoken::{decode, decode_header, DecodingKey, Validation};
+
     #[test]
     fn renders_copy_pasteable_command() {
         use crate::cli::{Command, StatusArgs};
@@ -731,5 +733,27 @@ mod tests {
         assert_eq!(json["gas_per_sec"], 50.0);
         assert!(json.get("testing_elapsed_secs").is_none());
         assert!(json.get("testing_gas_per_sec").is_none());
+    }
+
+    #[test]
+    fn jwt_signs_engine_auth_with_hs256() {
+        let secret = [0x42; 32];
+        let token = jwt(&secret).unwrap();
+        assert_eq!(decode_header(&token).unwrap().alg, Algorithm::HS256);
+
+        // Engine API tokens carry iat, not an exp claim.
+        let mut validation = Validation::new(Algorithm::HS256);
+        validation.required_spec_claims.clear();
+        validation.validate_exp = false;
+        let decoded =
+            decode::<serde_json::Value>(&token, &DecodingKey::from_secret(&secret), &validation)
+                .unwrap();
+        assert!(decoded.claims["iat"].as_u64().is_some());
+        assert!(decode::<serde_json::Value>(
+            &token,
+            &DecodingKey::from_secret(&[0x43; 32]),
+            &validation,
+        )
+        .is_err());
     }
 }
