@@ -170,18 +170,18 @@ fn read_benchmarkoor_source(
 
     let data = fs::read_to_string(&path)
         .with_context(|| format!("reading benchmarkoor source config {}", path.display()))?;
-    let yaml: serde_yaml::Value = serde_yaml::from_str(&data)
+    let yaml: Value = serde_saphyr::from_str(&data)
         .with_context(|| format!("parsing benchmarkoor source config {}", path.display()))?;
     Ok(Some(source_from_yaml(&yaml)?))
 }
 
-fn source_from_yaml(yaml: &serde_yaml::Value) -> Result<SuiteSource> {
+fn source_from_yaml(yaml: &Value) -> Result<SuiteSource> {
     let labels = get_path(
         yaml,
         &["runner", "benchmark", "tests", "metadata", "labels"],
     )
-    .and_then(|v| serde_json::to_value(v).ok())
-    .and_then(|v| v.as_object().cloned())
+    .and_then(Value::as_object)
+    .cloned()
     .unwrap_or_default();
 
     let archive = get_path(yaml, &["runner", "benchmark", "tests", "source", "archive"]);
@@ -213,7 +213,7 @@ fn source_from_yaml(yaml: &serde_yaml::Value) -> Result<SuiteSource> {
     })
 }
 
-fn get_path<'a>(value: &'a serde_yaml::Value, path: &[&str]) -> Option<&'a serde_yaml::Value> {
+fn get_path<'a>(value: &'a Value, path: &[&str]) -> Option<&'a Value> {
     let mut current = value;
     for key in path {
         current = get_key(current, key)?;
@@ -221,15 +221,13 @@ fn get_path<'a>(value: &'a serde_yaml::Value, path: &[&str]) -> Option<&'a serde
     Some(current)
 }
 
-fn get_key<'a>(value: &'a serde_yaml::Value, key: &str) -> Option<&'a serde_yaml::Value> {
-    value
-        .as_mapping()?
-        .get(serde_yaml::Value::String(key.to_string()))
+fn get_key<'a>(value: &'a Value, key: &str) -> Option<&'a Value> {
+    value.as_object()?.get(key)
 }
 
-fn string_array(value: &serde_yaml::Value) -> Vec<String> {
+fn string_array(value: &Value) -> Vec<String> {
     value
-        .as_sequence()
+        .as_array()
         .map(|seq| {
             seq.iter()
                 .filter_map(|v| v.as_str().map(ToOwned::to_owned))
@@ -268,6 +266,62 @@ mod tests {
         assert_eq!(
             sanitize_slug("perf-devnet-3/24358000/amsterdam"),
             "perf-devnet-3-24358000-amsterdam"
+        );
+    }
+
+    #[test]
+    fn resolves_yaml_source_metadata() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root
+            .path()
+            .join("contexts/repricing/jochemnet/24402727/amsterdam");
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(
+            directory.join("test-source.stateful.yaml"),
+            r#"
+runner:
+  benchmark:
+    tests:
+      metadata:
+        labels:
+          chain: jochemnet
+          enabled: true
+          count: 42
+      source:
+        archive:
+          pre_run_steps: &pre_run
+            - fixtures/funding.txt
+          steps:
+            setup: *pre_run
+            test:
+              - 'fixtures/testing/*.txt'
+      opcode_source:
+        file: fixtures/opcodes.json
+"#,
+        )
+        .unwrap();
+
+        let suite = Suite::resolve(
+            "jochemnet/24402727",
+            "repricing",
+            "amsterdam",
+            "stateful",
+            root.path(),
+        )
+        .unwrap();
+        assert_eq!(
+            suite.source.labels,
+            serde_json::json!({"chain": "jochemnet", "enabled": true, "count": 42})
+                .as_object()
+                .unwrap()
+                .clone()
+        );
+        assert_eq!(suite.source.pre_run_steps, ["fixtures/funding.txt"]);
+        assert_eq!(suite.source.setup_globs, ["fixtures/funding.txt"]);
+        assert_eq!(suite.source.testing_globs, ["fixtures/testing/*.txt"]);
+        assert_eq!(
+            suite.source.opcode_source.as_deref(),
+            Some("fixtures/opcodes.json")
         );
     }
 }

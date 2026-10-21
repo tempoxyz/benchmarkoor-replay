@@ -283,7 +283,7 @@ fn parse_github_release_url(release_url: &str) -> Result<(String, String, String
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
+    use std::{io::Write, path::Path};
 
     #[test]
     fn cache_filename_keeps_extension_hint() {
@@ -328,6 +328,25 @@ mod tests {
         assert_eq!(
             selected.as_deref(),
             Some("https://example.com/jochemnet.tar.gz")
+        );
+    }
+
+    #[test]
+    fn extracts_deflated_zip_fixture() {
+        let root = tempfile::tempdir().unwrap();
+        let archive = root.path().join("fixtures.zip");
+        let mut writer = zip::ZipWriter::new(File::create(&archive).unwrap());
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        writer.start_file("testing/fixture.txt", options).unwrap();
+        writer.write_all(b"fixture contents\n").unwrap();
+        writer.finish().unwrap();
+
+        let destination = root.path().join("extracted");
+        extract_archive(&archive, &destination).unwrap();
+        assert_eq!(
+            fs::read(destination.join("testing/fixture.txt")).unwrap(),
+            b"fixture contents\n"
         );
     }
 }
